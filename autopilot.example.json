@@ -1,0 +1,13 @@
+{
+  "interval": 0.025,
+  "bank_angle": 15.0,
+  "heading_tolerance": 2.0,
+  "altitude_tolerance": 10.0,
+  "level_pitch": 2.0,
+  "min_pitch": -15.0,
+  "max_pitch": 10.0,
+  "altitude": {"kp": 0.07, "ki": 0.007, "kd": 0.0, "integral_limit": 20.0},
+  "pitch": {"kp": 0.07, "ki": 0.007, "kd": 0.0, "integral_limit": 20.0},
+  "roll": {"kp": 0.01, "ki": 0.001, "kd": 0.0, "integral_limit": 20.0},
+  "yaw": {"kp": 0.025, "ki": 0.0025, "kd": 0.0, "integral_limit": 20.0}
+}

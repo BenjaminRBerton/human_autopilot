@@ -1,292 +1,125 @@
-import sys
-import xpc
-import PID
+﻿"""Ingescape adapter. Run with --help; importing has no side effects."""
+
+import argparse
+import json
+import logging
 import signal
-from datetime import datetime, timedelta
+import threading
 import time
-import numpy as np
-from echo import *
 
-SPEED = 90 # this is the speed of the plane in XPlane, used to determine if we are on ground or not
-refresh_rate = 0.1
-port = 5670
-agent_name = "Human_Autopilot"
-device = "wlp0s20f3" 
-verbose = False
-is_interrupted = False
-reset_requested = False
-start_heading = None
+from controller import Config, Controller, Gains, MEASUREMENTS, OUTPUTS, TARGETS
 
-def on_agent_event_callback(event, uuid, name, event_data, my_data):
-    agent_object = my_data
-    assert isinstance(agent_object, Echo)
-    # add code here if needed
+log = logging.getLogger(__name__)
 
-def on_freeze_callback(is_frozen, my_data):
-    agent_object = my_data
-    assert isinstance(agent_object, Echo)
-    # add code here if needed
 
-def normalize(value, min=-1, max=1):
-    # if value = 700, and max = 20, return 20
-    # if value = -200, and min = -20, return -20
-    if (value > max):
-        return max
-    elif (value < min):
-        return min  
-    else:
-        return value
+def load_config(path):
+    if path is None:
+        return Config()
+    with open(path, encoding="utf-8") as source:
+        values = json.load(source)
+    for name in ("roll", "pitch", "yaw", "altitude"):
+        if name in values:
+            values[name] = Gains(**values[name])
+    return Config(**values)
 
-update_interval = 0.025 # seconds, 0.05 = 20 Hz
 
-start = datetime.now()
-last_update = start
+class Agent:
+    """Serialize callbacks and computation so OFF cannot race with publication."""
 
-# defining the initial PID values
-P_pitch = 0.07 # PID library default = 0.2
-#P_roll = 0.01
-P_roll = 0.01
-P_yaw = 0.025
-I_pitch = P_pitch/10 # default = 0
-#I_pitch = 0
-#I_roll = 0
-I_roll = P_roll/10
-I_yaw = P_yaw/10
-D = 0 # default = 0
+    def __init__(self, igs, config):
+        self.igs = igs
+        self.controller = Controller(config)
+        self.lock = threading.RLock()
+        self.last_tick = None
 
-# initializing PID controllers
-roll_PID = PID.PID(P_roll, I_roll, D)
-pitch_PID = PID.PID(P_pitch, I_pitch, D)
-altitude_PID = PID.PID(P_pitch, I_pitch, D)
-yaw_PID = PID.PID(P_yaw, I_yaw, D)
+    def setup(self, name):
+        igs = self.igs
+        igs.agent_set_name(name)
+        igs.definition_set_version("2.0")
+        inputs = {"reset": igs.IMPULSION_T, "on_off": igs.BOOL_T}
+        inputs.update({name: igs.DOUBLE_T for name in MEASUREMENTS})
+        # Preserve original integer target wire types for existing mappings.
+        inputs.update({name: igs.INTEGER_T for name in TARGETS})
+        for name, kind in inputs.items():
+            igs.input_create(name, kind, False if name == "on_off" else None)
+        igs.output_create("on_off", igs.BOOL_T, False)
+        for name in OUTPUTS:
+            igs.output_create(name, igs.DOUBLE_T, None)
+        for name in inputs:
+            igs.observe_input(name, self.on_input, None)
+            source = "Aircraft" if name in MEASUREMENTS else "Cognitive_Model"
+            igs.mapping_add(name, source, name)
+            log.info("Mapped %s <- %s.%s", name, source, name)
 
-# setting the desired values
-# roll = 0 means wings level
-# pitch = 2 means slightly nose up, which is required for level flight
-desired_roll = 0
-desired_pitch = 10
-desired_altitude = 5000
-desired_skid = 0
+    def on_input(self, io_type, name, value_type, value, user_data):
+        with self.lock:
+            try:
+                was_enabled = self.controller.enabled
+                self.controller.set_input(name, value)
+                if name == "reset" or self.controller.enabled != was_enabled:
+                    self.last_tick = None
+                if name == "reset":
+                    self.igs.input_set_bool("on_off", False)
+                    self.igs.output_set_bool("on_off", False)
+                    for input_name in MEASUREMENTS + TARGETS:
+                        self.igs.clear_input(input_name)
+                    for output in OUTPUTS:
+                        self.igs.clear_output(output)
+                elif name == "on_off":
+                    if not self.controller.enabled:
+                        for output in OUTPUTS:
+                            self.igs.output_set_double(output, 0.0)
+                        log.info("OFF: pitch, roll and yaw controls set to zero")
+                    self.igs.output_set_bool("on_off", self.controller.enabled)
+            except ValueError:
+                log.exception("Rejected input %s=%r", name, value)
 
-# # setting the PID set points with our desired values
-pitch_PID.SetPoint = desired_pitch
-altitude_PID.SetPoint = desired_altitude
-yaw_PID.SetPoint = desired_skid
+    def tick(self, now):
+        with self.lock:
+            dt = self.controller.config.interval if self.last_tick is None else now - self.last_tick
+            self.last_tick = now
+            for name, value in self.controller.step(dt).items():
+                self.igs.output_set_double(name, value)
 
-DREFs = ["sim/cockpit2/gauges/indicators/airspeed_kts_pilot",
-        "sim/cockpit2/gauges/indicators/heading_electric_deg_mag_pilot",
-        "sim/flightmodel/failures/onground_any",
-        "sim/flightmodel/misc/h_ind",
-        "sim/flightmodel/controls/parkbrake",
-        "sim/cockpit2/engine/actuators/throttle_ratio_all"
-        ]
 
-def main():
-    global agent
-    global reset_requested
-    global last_update
-    global desired_roll
-    global desired_altitude
-    
-    while True:  # Outer loop to allow reset
-        reset_requested = False
-        agent.on_off_i = False
-        
-        # Wait for on_off signal
-        while(agent.on_off_i == False):
-            if reset_requested:
-                break
-            time.sleep(0.1)
-        
-        if reset_requested:
-            continue  # Restart from the beginning
-            
-        global i
-        start = True
-        igs.output_set_double("controlPitch", 0)
-        igs.output_set_double("controlRoll", 0)
-        igs.output_set_double("controlYaw", 0)
-        
-        # Main control loop
-        while True:
-            if reset_requested:
-                print("Reset detected, restarting...")
-                break  # Break to outer loop
-            if (datetime.now() > last_update + timedelta(milliseconds = update_interval * 1000)):
-                last_update = datetime.now()
-                current_roll = agent.roll_i
-                current_hdg = agent.heading_i
-                current_pitch = agent.pitch_i
-                current_altitude = agent.int_alt
-                current_asi = agent.airspeed_i
-                current_rudder = agent.control_yaw_o if agent.control_yaw_o is not None else -998
-                current_skid = agent.skid_i if agent.skid_i is not None else -998
-                print(f"\rRudder position: {current_rudder:8.3f} | Current skid: {current_skid:8.3f}", end='', flush=True)
-                # if the plane is on ground, set the park brake and throttle to 0
-                if (start):
-                    print("start")
-                    igs.output_set_double("thrust", 1)
-                    igs.output_set_int("alt_sel", int(desired_altitude/100))
-                    igs.output_set_int("heading_sel", int(current_hdg))
-                    time.sleep(8)
-                    igs.output_set_double("parkingBrake", 0)
-                    user_requested_heading = agent.heading_i
-                    print(f"runway heading: {user_requested_heading}")
-                    start = False
-                if(current_asi > SPEED):  
-                    marge_derreur = 2 # 5 degrees of error
-                    if agent.heading_t_i is not None:
-                        user_requested_heading = agent.heading_t_i #roll_PID.user_requested_heading
-                    current_hdg
-                    if user_requested_heading is not None:
-                        bearing_difference = (user_requested_heading - current_hdg + 180) % 360 - 180
-                        if(bearing_difference < 0):
-                            desired_roll = -30 
-                        elif(bearing_difference > 0):
-                            desired_roll = 30
-                        else:
-                            desired_roll = 0  
-                        if(np.abs(bearing_difference) < marge_derreur):
-                            desired_roll = 0 
-                        roll_PID.SetPoint = desired_roll
-                    altitude_PID.SetPoint = agent.int_alt_target if agent.int_alt_target is not None else desired_altitude
-                    altitude_PID.update(current_altitude)
-                    pitch_PID.SetPoint = normalize(altitude_PID.output, min=-15, max=10)
-                    roll_PID.update(current_roll)
-                    pitch_PID.update(current_pitch)
-                    if (current_skid > 0.7 or current_skid < -0.7):
-                        yaw_PID.update(current_skid)
-                        new_rudder_ctrl = normalize(yaw_PID.output,min=-1,max=1)
-                    else:
-                        new_rudder_ctrl = current_rudder
-                    new_ail_ctrl = normalize(roll_PID.output)
-                    new_ele_ctrl = normalize(pitch_PID.output)
-                    agent.control_pitch_o = new_ele_ctrl
-                    agent.control_roll_o = new_ail_ctrl
-                    agent.control_yaw_o = new_rudder_ctrl
-                    igs.output_set_double("controlPitch", new_ele_ctrl)
-                    igs.output_set_double("controlRoll", new_ail_ctrl)
-                    igs.output_set_double("controlYaw", new_rudder_ctrl)
-                    output = f"current values --    roll: {current_roll: 0.3f},  pitch: {current_pitch: 0.3f}"
-                    output = output + "\n" + f"PID outputs    --    roll: {roll_PID.output: 0.3f},  pitch: {pitch_PID.output: 0.3f}"
-                    output = output + "\n"
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", default="Wi-Fi 2")
+    parser.add_argument("--port", type=int, default=5670)
+    parser.add_argument("--name", default="Human_Autopilot")
+    parser.add_argument("--config", help="JSON controller parameters")
+    parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
+    parser.add_argument("--log-file", help="Optional file in addition to console logging")
+    args = parser.parse_args(argv)
+    handlers = [logging.StreamHandler()]
+    if args.log_file:
+        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+    logging.basicConfig(level=args.log_level, handlers=handlers,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try:
+        config = load_config(args.config)
+    except (OSError, ValueError, TypeError) as exc:
+        parser.error(str(exc))
+    # Tests and --help do not need the runtime dependency installed.
+    import ingescape as igs
 
-def signal_handler(signal_received, frame):
-    global is_interrupted
-    print("\n", signal.strsignal(signal_received), sep="")
-    is_interrupted = True
+    agent = Agent(igs, config)
+    agent.setup(args.name)
+    stop = threading.Event()
+    previous_handler = signal.signal(signal.SIGINT, lambda *_: stop.set())
+    try:
+        if igs.start_with_device(args.device, args.port) != igs.SUCCESS:
+            raise RuntimeError(f"Could not start Ingescape on {args.device}:{args.port}")
+        log.info("Started OFF on %s:%s; config=%s", args.device, args.port, config)
+        while not stop.is_set():
+            started = time.monotonic()
+            agent.tick(started)
+            stop.wait(max(0.0, config.interval - (time.monotonic() - started)))
+    finally:
+        igs.stop()
+        signal.signal(signal.SIGINT, previous_handler)
+        log.info("Stopped")
 
-def impulsion_input_callback(io_type, name, value_type, value, my_data):
-    global reset_requested
-    igs.info(f"Input {name} written to {value}")
-    agent_object = my_data
-    assert isinstance(agent_object, Echo)
-    if name == "reset":
-        print("Resetting autopilot...")
-        reset_requested = True
 
-        
-def bool_input_callback(io_type, name, value_type, value, my_data):
-    agent_object = my_data
-    assert isinstance(agent_object, Echo)
-    if name == "on_off":
-        agent_object.on_off_i = value
-
-def integer_input_callback(io_type, name, value_type, value, my_data):
-    igs.info(f"Input {name} written to {value}")
-    agent_object = my_data
-    assert isinstance(agent_object, Echo)
-
-def double_input_callback(io_type, name, value_type, value, my_data):
-    agent_object = my_data
-    assert isinstance(agent_object, Echo)
-    if name == "pitch":
-        agent_object.pitch_i = value
-    if name == "pitchTarget":
-        agent_object.pitch_t_i = value
-    if name == "heading":
-        agent_object.heading_i = value
-    if name == "headingTarget":
-        agent_object.heading_t_i = value
-    if name == "altitude":
-        agent_object.int_alt = value
-    if name == "altitudeTarget":
-        print(f"altitude target input: {value}")
-        agent_object.int_alt_target = value
-    if name == "airspeed":
-        agent_object.airspeed_i = value
-    if name == "airspeedTarget":
-        agent_object.airspeed_t_i = value
-    if name == "verticalSpeed":
-        agent_object.vertical_speed_i = value
-    if name == "verticalSpeedTarget":
-        agent_object.vertical_speed_t_i = value
-    if name == "roll":
-        agent_object.roll_i = value
-    if name == "rollTarget":
-        agent_object.roll_t_i = value
-    if name == "skid":
-        agent_object.skid_i = value
-
-# catch SIGINT handler before starting agent
-signal.signal(signal.SIGINT, signal_handler)
-igs.agent_set_name(agent_name)
-igs.definition_set_version("1.0")
-igs.log_set_console(verbose)
-igs.log_set_file(True, None)
-igs.log_set_stream(verbose)
-igs.set_command_line(sys.executable + " " + " ".join(sys.argv))
-
-agent = Echo()
-
-igs.observe_agent_events(on_agent_event_callback, agent)
-igs.observe_freeze(on_freeze_callback, agent)
-
-igs.input_create("reset", igs.IMPULSION_T, None)
-igs.input_create("on_off", igs.BOOL_T, None)
-igs.input_create("heading", igs.DOUBLE_T, None)
-igs.input_create("headingTarget", igs.INTEGER_T, None)
-igs.input_create("airspeed", igs.DOUBLE_T, None)
-igs.input_create("airspeedTarget", igs.INTEGER_T, None)
-igs.input_create("altitude", igs.DOUBLE_T, None)
-igs.input_create("altitudeTarget", igs.INTEGER_T, None)
-igs.input_create("verticalSpeed", igs.DOUBLE_T, None)
-igs.input_create("verticalSpeedTarget", igs.INTEGER_T, None)
-igs.input_create("roll", igs.DOUBLE_T, None)
-igs.input_create("rollTarget", igs.INTEGER_T, None)
-igs.input_create("pitch", igs.DOUBLE_T, None)
-igs.input_create("pitchTarget", igs.INTEGER_T, None)
-igs.input_create("skid", igs.DOUBLE_T, None)
-
-igs.output_create("controlPitch", igs.DOUBLE_T, None)
-igs.output_create("controlRoll", igs.DOUBLE_T, None)
-igs.output_create("controlYaw", igs.DOUBLE_T, None)
-igs.output_create("thrust", igs.DOUBLE_T, None)
-igs.output_create("parkingBrake", igs.DOUBLE_T, None) # tbdeleted
-igs.output_create("alt_sel", igs.INTEGER_T, None)
-igs.output_create("heading_sel", igs.INTEGER_T, None)
-
-igs.observe_input("reset", impulsion_input_callback, agent)
-igs.observe_input("on_off", bool_input_callback, agent)
-igs.observe_input("pitch", double_input_callback, agent)
-igs.observe_input("heading", double_input_callback, agent)
-igs.observe_input("altitude", double_input_callback, agent)
-igs.observe_input("airspeed", double_input_callback, agent)
-igs.observe_input("verticalSpeed", double_input_callback, agent)
-igs.observe_input("roll", double_input_callback, agent)
-igs.observe_input("pitchTarget", double_input_callback, agent)
-igs.observe_input("headingTarget", double_input_callback, agent)
-igs.observe_input("airspeedTarget", double_input_callback, agent)
-igs.observe_input("altitudeTarget", double_input_callback, agent)
-igs.observe_input("verticalSpeedTarget", double_input_callback, agent)
-igs.observe_input("rollTarget", double_input_callback, agent)
-igs.observe_input("skid", double_input_callback, agent)
-
-igs.log_set_console(True)
-igs.log_set_console_level(igs.LOG_INFO)
-
-igs.start_with_device(device, port)
-# catch SIGINT handler after starting agent
-signal.signal(signal.SIGINT, signal_handler)
-
-main()
+if __name__ == "__main__":
+    main()
